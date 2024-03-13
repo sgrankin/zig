@@ -417,34 +417,7 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     const fn_ty = @as(*const clang.FunctionType, @ptrCast(fn_type));
     const return_qt = fn_ty.getReturnType();
 
-    const proto_node = switch (fn_type.getTypeClass()) {
-        .FunctionProto => blk: {
-            const fn_proto_type = @as(*const clang.FunctionProtoType, @ptrCast(fn_type));
-            if (has_body and fn_proto_type.isVariadic()) {
-                decl_ctx.has_body = false;
-                decl_ctx.storage_class = .Extern;
-                decl_ctx.is_export = false;
-                decl_ctx.is_always_inline = false;
-                try warn(c, &c.global_scope.base, fn_decl_loc, "TODO unable to translate variadic function, demoted to extern", .{});
-            }
-            break :blk transFnProto(c, fn_decl, fn_proto_type, fn_decl_loc, decl_ctx, true) catch |err| switch (err) {
-                error.UnsupportedType => {
-                    return failDecl(c, fn_decl_loc, fn_name, "unable to resolve prototype of function", .{});
-                },
-                error.OutOfMemory => |e| return e,
-            };
-        },
-        .FunctionNoProto => blk: {
-            const fn_no_proto_type = @as(*const clang.FunctionType, @ptrCast(fn_type));
-            break :blk transFnNoProto(c, fn_no_proto_type, fn_decl_loc, decl_ctx, true) catch |err| switch (err) {
-                error.UnsupportedType => {
-                    return failDecl(c, fn_decl_loc, fn_name, "unable to resolve prototype of function", .{});
-                },
-                error.OutOfMemory => |e| return e,
-            };
-        },
-        else => return failDecl(c, fn_decl_loc, fn_name, "unable to resolve function type {}", .{fn_type.getTypeClass()}),
-    };
+    const proto_node = if (try fnProtoNode(c, &decl_ctx, fn_type, fn_decl, fn_name)) |v| v else return;
 
     if (!decl_ctx.has_body) {
         return addTopLevelDecl(c, fn_name, Node.initPayload(&proto_node.base));
@@ -527,6 +500,61 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     }
 
     return addTopLevelDecl(c, fn_name, Node.initPayload(&proto_node.base));
+}
+
+fn fnProtoNode(
+    c: *Context,
+    decl_ctx: *FnDeclContext,
+    fn_type: *const clang.Type,
+    fn_decl: *const clang.FunctionDecl,
+    fn_name: []u8,
+) Error!?*ast.Payload.Func {
+    const has_body = fn_decl.hasBody();
+    const fn_decl_loc = fn_decl.getLocation();
+    return switch (fn_type.getTypeClass()) {
+        .FunctionProto => blk: {
+            const fn_proto_type = @as(*const clang.FunctionProtoType, @ptrCast(fn_type));
+            if (has_body and fn_proto_type.isVariadic()) {
+                decl_ctx.has_body = false;
+                decl_ctx.storage_class = .Extern;
+                decl_ctx.is_export = false;
+                decl_ctx.is_always_inline = false;
+                try warn(c, &c.global_scope.base, fn_decl_loc, "TODO unable to translate variadic function, demoted to extern", .{});
+            }
+            break :blk transFnProto(c, fn_decl, fn_proto_type, fn_decl_loc, decl_ctx.*, true) catch |err| switch (err) {
+                error.UnsupportedType => {
+                    try failDecl(c, fn_decl_loc, fn_name, "unable to resolve prototype of function", .{});
+                    return null;
+                },
+                error.OutOfMemory => |e| return e,
+            };
+        },
+        .FunctionNoProto => blk: {
+            const fn_no_proto_type = @as(*const clang.FunctionType, @ptrCast(fn_type));
+            break :blk transFnNoProto(c, fn_no_proto_type, fn_decl_loc, decl_ctx.*, true) catch |err| switch (err) {
+                error.UnsupportedType => {
+                    try failDecl(c, fn_decl_loc, fn_name, "unable to resolve prototype of function", .{});
+                    return null;
+                },
+                error.OutOfMemory => |e| return e,
+            };
+        },
+        .Elaborated => {
+            const elaborated_ty = @as(*const clang.ElaboratedType, @ptrCast(fn_type));
+            const qt = elaborated_ty.getNamedType();
+            return fnProtoNode(c, decl_ctx, qt.getTypePtr(), fn_decl, fn_name);
+        },
+        .Typedef => {
+            const typedef_ty = @as(*const clang.TypedefType, @ptrCast(fn_type));
+            const typedef_decl = typedef_ty.getDecl();
+            const underlying_type = typedef_decl.getUnderlyingType();
+            return fnProtoNode(c, decl_ctx, underlying_type.getTypePtr(), fn_decl, fn_name);
+        },
+        else => {
+            try failDecl(c, fn_decl_loc, fn_name, "unable to resolve function type {}", .{fn_type.getTypeClass()});
+            return null;
+        },
+    };
 }
 
 fn transQualTypeMaybeInitialized(c: *Context, scope: *Scope, qt: clang.QualType, decl_init: ?*const clang.Expr, loc: clang.SourceLocation) TransError!Node {
